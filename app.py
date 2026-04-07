@@ -8,7 +8,7 @@ import os
 
 app = Flask(__name__)
 
-TOKEN = os.getenv("TO8732483672:AAEJWmKv86uA_v2dgmbeoywYYGuvUzQpYoEKEN")
+TOKEN = os.getenv("8732483672:AAEJWmKv86uA_v2dgmbeoywYYGuvUzQpYoE")
 CHAT_ID = os.getenv("1051828051")
 
 last_signal = None
@@ -17,49 +17,69 @@ def send_telegram(msg):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
 
-def is_market_open():
-    india = pytz.timezone('Asia/Kolkata')
-    now = datetime.now(india)
+def calculate_rsi(data, period=14):
+    delta = data["Close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
 
-    if now.weekday() >= 5:
-        return False
-
-    current_time = now.time()
-    return current_time >= datetime.strptime("09:30","%H:%M").time() and current_time <= datetime.strptime("15:30","%H:%M").time()
-
-@app.route("/")
-def run_bot():
+def get_signal():
     global last_signal
-
-    if not is_market_open():
-        return "Market Closed"
-
     data = yf.download("^NSEI", interval="5m", period="1d")
 
     if isinstance(data.columns, pd.MultiIndex):
         data.columns = data.columns.get_level_values(0)
 
-    data["EMA9"] = data["Close"].ewm(span=9).mean()
+    if len(data) < 25:
+        return "Waiting for candles..."
+
     data["EMA20"] = data["Close"].ewm(span=20).mean()
+    data["VWAP"] = (data["Close"] * data["Volume"]).cumsum() / data["Volume"].cumsum()
+    data["RSI"] = calculate_rsi(data)
 
     last = len(data) - 1
     prev = last - 1
 
-    ema9_now = data["EMA9"].iloc[last]
-    ema20_now = data["EMA20"].iloc[last]
+    close_now = data["Close"].iloc[last]
+    close_prev = data["Close"].iloc[prev]
+    ema_now = data["EMA20"].iloc[last]
+    ema_prev = data["EMA20"].iloc[prev]
+    vwap_now = data["VWAP"].iloc[last]
+    rsi_now = data["RSI"].iloc[last]
 
-    ema9_prev = data["EMA9"].iloc[prev]
-    ema20_prev = data["EMA20"].iloc[prev]
+    # BUY CALL
+    if (close_now > ema_now and close_prev <= ema_prev
+        and close_now > vwap_now
+        and rsi_now > 55
+        and last_signal != "BUY"):
 
-    price = data["Close"].iloc[last]
-    time_now = datetime.now().strftime("%H:%M:%S")
-
-    if ema9_now > ema20_now and ema9_prev <= ema20_prev and last_signal != "BUY":
         last_signal = "BUY"
-        send_telegram(f"🚨 BUY NIFTY @ {price} ⏰ {time_now}")
+        msg = f"🚨 BUY CALL @ {close_now} RSI {rsi_now}"
+        send_telegram(msg)
+        return msg
 
-    elif ema9_now < ema20_now and ema9_prev >= ema20_prev and last_signal != "SELL":
+    # BUY PUT
+    elif (close_now < ema_now and close_prev >= ema_prev
+          and close_now < vwap_now
+          and rsi_now < 45
+          and last_signal != "SELL"):
+
         last_signal = "SELL"
-        send_telegram(f"🚨 SELL NIFTY @ {price} ⏰ {time_now}")
+        msg = f"🚨 BUY PUT @ {close_now} RSI {rsi_now}"
+        send_telegram(msg)
+        return msg
 
-    return "Bot Checked"
+    else:
+        return "No Signal"
+
+@app.route("/")
+def home():
+    return get_signal()
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
